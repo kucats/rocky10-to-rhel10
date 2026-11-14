@@ -114,6 +114,6 @@ hashes, and should be run before every push. There is no CI.
 
 ## License
 
-MIT, see [LICENSE](LICENSE). RHEL and the RHEL KVM guest image are
+GPL-3.0, see [LICENSE](LICENSE). RHEL and the RHEL KVM guest image are
 Red Hat's and are subject to your subscription terms; they are not part of
 this repository.
