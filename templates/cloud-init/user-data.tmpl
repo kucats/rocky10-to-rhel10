@@ -1,0 +1,32 @@
+#cloud-config
+# Rendered by bin/r2r-prepare-image. Placeholders are filled from config.env;
+# the users, runcmd and ssh_keys blocks are generated.
+hostname: @HOSTNAME_SHORT@
+fqdn: @HOSTNAME@
+prefer_fqdn_over_hostname: true
+
+ssh_pwauth: false
+disable_root: true
+
+users:
+@@USERS@@
+
+@@SSH_KEYS@@
+
+write_files:
+  # Do not create automatic DHCP profiles for other NICs; they make
+  # NetworkManager-wait-online fail on VPSes with extra (local) NICs.
+  - path: /etc/NetworkManager/conf.d/90-no-auto-default.conf
+    owner: root:root
+    permissions: '0644'
+    content: |
+      [main]
+      no-auto-default=*
+
+runcmd:
+  # Primary group GID = UID (cloud-init picks the next free GID otherwise).
+@@RUNCMD@@
+  # kdump cannot reserve crashkernel memory on 1 GB VPSes.
+  - [sh, -c, 'systemctl disable --now kdump.service || true']
+  # The KVM image enables Cockpit, which listens publicly on TCP 9090.
+  - [sh, -c, 'systemctl disable --now cockpit.socket || true']

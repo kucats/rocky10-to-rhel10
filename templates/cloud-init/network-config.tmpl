@@ -1,0 +1,19 @@
+# cloud-init network-config v2 (static). Matched by MAC, renamed with set-name.
+# cloud-init 24.4 rejects "to: default": the IPv4 default route must be 0.0.0.0/0.
+version: 2
+ethernets:
+  @NIC_NAME@:
+    match:
+      macaddress: "@NIC_MAC@"
+    set-name: @NIC_NAME@
+    dhcp4: false
+    dhcp6: false
+    addresses:
+      - @IPV4_ADDR@
+@@IPV6_ADDRESS@@
+    routes:
+      - to: 0.0.0.0/0
+        via: @IPV4_GW@
+@@IPV6_ROUTE@@
+    nameservers:
+      addresses: [@DNS_LIST@]

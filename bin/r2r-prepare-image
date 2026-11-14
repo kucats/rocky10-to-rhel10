@@ -1,0 +1,112 @@
+#!/usr/bin/env bash
+# Build the image to write: qcow2 -> raw, fstab nofail, cloud-init seed,
+# zstd, checksums. Runs on your workstation (Linux, or macOS with docker).
+#
+# Usage:
+#   r2r-prepare-image [-c config.env]              full build
+#   r2r-prepare-image [-c config.env] --seed-only  render the seed only
+#   r2r-prepare-image --inner <raw> <seed-dir> <parts-env>   (internal; Linux root)
+#
+# Output in $WORKDIR: $IMAGE_NAME.raw, $IMAGE_NAME.raw.zst, $IMAGE_NAME.manifest,
+# seed/. All of them can contain secrets (keys, hashes): they are gitignored.
+set -euo pipefail
+R2R_ROOT=$(cd "$(dirname "$0")/.." && pwd)
+. "$R2R_ROOT/lib/common.sh"
+
+# ---- internal: modify the raw image (Linux, root) ----
+inner() {
+  local raw=$1 seed=$2 parts=$3 mnt loop
+  is_linux && is_root || die "--inner needs Linux and root"
+  need_cmd sfdisk losetup mount setfattr
+  SOURCE_OS=rocky10 TARGET_OS=${TARGET_OS:-rhel10} PROVIDER=generic
+  # shellcheck disable=SC1090
+  . "$R2R_ROOT/lib/os/$TARGET_OS.sh"
+  rhel10_find_parts "$raw"
+  printf 'ROOT_PART=%s\nROOT_OFFSET=%s\nROOT_SIZE=%s\nEFI_PART=%s\nEFI_OFFSET=%s\nEFI_SIZE=%s\n' \
+    "$ROOT_PART" "$ROOT_OFFSET" "$ROOT_SIZE" "$EFI_PART" "${EFI_OFFSET:-}" "${EFI_SIZE:-}" > "$parts"
+  # Containers may lack loop device nodes created after they started.
+  for i in 0 1 2 3 4 5 6 7; do [ -e /dev/loop$i ] || mknod -m 660 /dev/loop$i b 7 $i 2>/dev/null || true; done
+  loop=$(losetup -f --show -o "$ROOT_OFFSET" --sizelimit "$ROOT_SIZE" "$raw")
+  mnt=$(mktemp -d)
+  # shellcheck disable=SC2064
+  trap "umount '$mnt' 2>/dev/null; losetup -d '$loop' 2>/dev/null; rmdir '$mnt'" EXIT
+  mount -o nouuid "$loop" "$mnt"
+  [ -f "$mnt/etc/redhat-release" ] || die "mounted partition does not look like a RHEL root"
+  log "image OS: $(cat "$mnt/etc/redhat-release")"
+  rhel10_fstab_nofail "$mnt"
+  rhel10_install_seed "$mnt" "$seed"
+  sync
+  # Unmount before anything hashes or compresses the file.
+  umount "$mnt"; losetup -d "$loop"; rmdir "$mnt"; trap - EXIT
+  sync
+  log "image modified and unmounted"
+}
+
+if [ "${1:-}" = --inner ]; then shift; inner "$@"; exit 0; fi
+
+cfg=""; seed_only=no
+while [ $# -gt 0 ]; do
+  case $1 in
+    -c) cfg=$2; shift 2 ;;
+    --seed-only) seed_only=yes; shift ;;
+    -h|--help) sed -n '2,12p' "$0"; exit 0 ;;
+    *) die "unknown argument $1" ;;
+  esac
+done
+r2r_load_config "$cfg"
+require_vars HOSTNAME_FQDN NIC_MAC NIC_NAME ADMIN_USER ADMIN_UID ADMIN_KEYS_FILE WORKDIR IMAGE_NAME
+valid_mac "$NIC_MAC" || die "NIC_MAC '$NIC_MAC' is not a MAC address"
+if [ "$NET_MODE" = static ]; then
+  require_vars IPV4_ADDR IPV4_GW DNS_SERVERS
+  valid_cidr4 "$IPV4_ADDR" || die "IPV4_ADDR must be address/prefix"
+fi
+if [ -z "${ADMIN_HASHED_PASSWD:-}" ] && [ -z "${AUTOMATION_USER:-}" ]; then
+  die "no ADMIN_HASHED_PASSWD and no AUTOMATION_USER: nobody could use sudo"
+fi
+[ -z "${AUTOMATION_USER:-}" ] || require_vars AUTOMATION_UID AUTOMATION_KEYS_FILE
+provider_notes
+
+work=$(cfg_path "$WORKDIR"); mkdir -p "$work"; chmod 700 "$work"
+seed=$work/seed
+rm -rf "$seed"
+rhel10_render_seed "$seed"
+log "seed written to $seed"
+[ "$seed_only" = yes ] && exit 0
+
+qcow=$(cfg_path "$QCOW2"); [ -f "$qcow" ] || die "QCOW2 $qcow not found"
+raw=$work/$IMAGE_NAME.raw zst=$raw.zst parts=$work/$IMAGE_NAME.parts
+need_cmd qemu-img zstd
+
+log "converting $qcow to raw"
+rm -f "$raw" "$zst"
+qemu-img convert -p -O raw "$qcow" "$raw"
+
+if is_linux && is_root; then
+  inner "$raw" "$seed" "$parts"
+else
+  ccmd=${CONTAINER_CMD:-docker}; need_cmd "$ccmd"
+  log "modifying the image in a privileged $ccmd container (${HELPER_IMAGE:=quay.io/fedora/fedora:42})"
+  "$ccmd" run --rm --privileged \
+    -v "$R2R_ROOT:/r2r:ro" -v "$work:/work" -e TARGET_OS="$TARGET_OS" \
+    "$HELPER_IMAGE" bash -c "dnf -y -q install util-linux attr >/dev/null && \
+      /r2r/bin/r2r-prepare-image --inner /work/$IMAGE_NAME.raw /work/seed /work/$IMAGE_NAME.parts"
+fi
+
+: "${ZSTD_LEVEL:=12}"
+log "compressing (zstd -$ZSTD_LEVEL)"
+zstd -q -"$ZSTD_LEVEL" -T0 -f "$raw" -o "$zst"
+chmod 600 "$raw" "$zst"
+
+log "checksums"
+raw_sha=$(sha256_of "$raw")
+[ "$(zstd -dc "$zst" | sha256_stdin)" = "$raw_sha" ] || die "decompressed .zst does not match the raw image"
+{
+  printf 'RAW_FILE=%s\nZST_FILE=%s\n' "$(basename "$raw")" "$(basename "$zst")"
+  printf 'RAW_BYTES=%s\n' "$(file_size "$raw")"
+  printf 'RAW_SHA256=%s\n' "$raw_sha"
+  printf 'ZST_BYTES=%s\n' "$(file_size "$zst")"
+  printf 'ZST_SHA256=%s\n' "$(sha256_of "$zst")"
+  cat "$parts"
+} > "$work/$IMAGE_NAME.manifest"
+cat "$work/$IMAGE_NAME.manifest" >&2
+log "done. Next: bin/r2r-local-test, then bin/r2r-stage"
