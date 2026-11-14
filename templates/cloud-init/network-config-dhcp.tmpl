@@ -1,0 +1,9 @@
+# cloud-init network-config v2 (DHCP). Matched by MAC, renamed with set-name.
+version: 2
+ethernets:
+  @NIC_NAME@:
+    match:
+      macaddress: "@NIC_MAC@"
+    set-name: @NIC_NAME@
+    dhcp4: true
+    dhcp6: false

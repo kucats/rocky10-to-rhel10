@@ -1,0 +1,162 @@
+#!/bin/bash
+# Overwrite the running system's boot disk with a prepared raw image, from RAM.
+# Runs ON THE TARGET as root. Self-contained: needs no other file of this repo.
+#
+# DESTRUCTIVE: in write mode the current OS on <disk> is destroyed.
+#
+# Usage:
+#   r2r-takeover check <staged.raw.zst> <zst-sha256> <raw-sha256> <raw-bytes> [disk]
+#   r2r-takeover write <staged.raw.zst> <zst-sha256> <raw-sha256> <raw-bytes> [disk]
+#
+# check: verifies the CPU (x86-64-v3), the staged file's checksum, and that
+#   every extent of it lies beyond the region that will be overwritten
+#   (raw-bytes + margin). Changes nothing.
+# write: the same checks, then asks for confirmation, copies the tools into a
+#   tmpfs, stops a few services, remounts everything read-only (sysrq u), sets
+#   every mounted partition of <disk> read-only at the block layer, streams
+#   the image from the staged file's raw extents onto <disk>, verifies the
+#   written bytes and reboots (sysrq b). On a verification mismatch it retries
+#   once and then stops WITHOUT rebooting. Progress goes to /dev/kmsg (console).
+#
+# Environment:
+#   R2R_MARGIN_BYTES   safety gap after the image (default 1 GiB)
+#   R2R_STOP_SERVICES  services stopped before the write
+#   R2R_ASSUME_YES=1   skip the interactive confirmation
+#   R2R_ALLOW_NO_V3=1  skip the x86-64-v3 check (only for non-RHEL-10 images)
+set -euo pipefail
+
+mode=${1:?mode check|write}; src=${2:?staged file}; zsha=${3:?zst sha256}; rsha=${4:?raw sha256}
+rbytes=${5:?raw bytes}; disk=${6:-/dev/vda}
+margin=${R2R_MARGIN_BYTES:-$((1024*1024*1024))}
+services=${R2R_STOP_SERVICES:-crond rsyslog chronyd tuned NetworkManager-dispatcher}
+rt=/dev/shm/r2r-rt
+
+die() { echo "ERROR: $*" >&2; exit 1; }
+case $mode in check|write) ;; *) die "unknown mode $mode" ;; esac
+[ "$(id -u)" = 0 ] || die "must run as root"
+[ -b "$disk" ] || die "$disk is not a block device"
+[ -f "$src" ] || die "missing $src"
+case $rbytes in ''|*[!0-9]*) die "raw-bytes must be a number" ;; esac
+for t in zstd sha256sum filefrag dd findmnt blockdev setsid ldd; do
+  command -v $t >/dev/null || die "missing tool $t"
+done
+
+if [ "${R2R_ALLOW_NO_V3:-0}" != 1 ]; then
+  /usr/lib64/ld-linux-x86-64.so.2 --help 2>/dev/null | grep -q 'x86-64-v3 (supported' \
+    || die "this vCPU does not support x86-64-v3; RHEL 10 would not boot. Not writing."
+  echo "== x86-64-v3 supported"
+fi
+
+dsize=$(blockdev --getsize64 "$disk")
+[ "$dsize" -gt $((rbytes + margin)) ] || die "$disk ($dsize bytes) is smaller than image + margin"
+
+echo "== verifying staged file checksum"
+echo "$zsha  $src" | sha256sum -c - >/dev/null || die "staged file sha256 mismatch"
+
+# Partition holding the staged file, and its start on the disk.
+part=$(findmnt -n -o SOURCE --target "$src")
+part=$(readlink -f "$part")
+pname=$(basename "$part")
+[ -e "/sys/class/block/$pname/start" ] || die "cannot find partition start for $part (LVM/RAID is not supported)"
+pstart=$(( $(cat "/sys/class/block/$pname/start") * 512 ))
+parent=/dev/$(basename "$(readlink -f "/sys/class/block/$pname/..")")
+[ "$parent" = "$(readlink -f "$disk")" ] || die "$src is on $parent, not $disk"
+bs=$(stat -f -c %S "$(dirname "$src")")
+
+# Physical extents (absolute byte offsets on $disk), in logical order.
+extfile=$(mktemp)
+sync
+filefrag -e -v "$src" > "$extfile.raw"
+if grep -E '^ *[0-9]+:' "$extfile.raw" | grep -Eq 'unknown_loc|delalloc|inline|encoded|unwritten'; then
+  die "staged file has extents without a stable on-disk location; sync and retry"
+fi
+awk -v bs="$bs" -v ps="$pstart" '
+  /^ *[0-9]+:/ {
+    gsub(/\.\./," "); gsub(/:/," ");
+    # fields: idx lstart lend pstart pend len ...
+    lstart=$2; pst=$4; len=$6;
+    printf "%d %d %d\n", lstart*bs, ps + pst*bs, len*bs
+  }' "$extfile.raw" > "$extfile"
+fsize=$(stat -c %s "$src")
+total=$(awk '{s+=$3} END{print s+0}' "$extfile")
+[ "$total" -ge "$fsize" ] || die "extent map incomplete ($total < $fsize)"
+minoff=$(awk 'NR==1||$2<m{m=$2} END{print m}' "$extfile")
+limit=$((rbytes + margin))
+echo "== staged file: $fsize bytes in $(wc -l <"$extfile") extent(s); lowest disk offset $minoff; must be >= $limit"
+[ "$minoff" -ge "$limit" ] || die "staged file overlaps the overwrite region; re-stage it (bigger filler)"
+# Extents must be in logical order and contiguous in logical space.
+awk 'BEGIN{e=0} {if($1!=e){exit 1} e=$1+$3}' "$extfile" || die "unexpected extent ordering"
+
+if [ "$mode" = check ]; then echo "CHECK OK (nothing changed)"; exit 0; fi
+
+if [ "${R2R_ASSUME_YES:-0}" != 1 ]; then
+  host=$(uname -n)
+  [ -n "$host" ] || die "cannot determine the host name for the confirmation"
+  echo "About to DESTROY the OS on $disk of host '$host' and write the image."
+  printf 'Type the host name to continue: '
+  read -r answer || true
+  [ "$answer" = "$host" ] || die "confirmation did not match; nothing changed"
+fi
+
+echo "== building tmpfs runtime in $rt"
+rm -rf "$rt"; mkdir -p "$rt/bin" "$rt/lib"
+for b in bash zstd dd sha256sum sync head cat sleep date; do
+  p=$(command -v $b); cp -L "$p" "$rt/bin/"
+  ldd "$p" | awk '/=>/ {print $3} /^\s*\/.*ld-linux/ {print $1}' | while read -r l; do
+    [ -n "$l" ] && cp -Ln "$l" "$rt/lib/" 2>/dev/null || true
+  done
+done
+ld=$rt/lib/ld-linux-x86-64.so.2
+[ -x "$ld" ] || die "dynamic loader not copied to $rt/lib"
+cp "$extfile" "$rt/extents"
+cat > "$rt/run.sh" <<EOF
+L="$ld --library-path $rt/lib"
+B=$rt/bin
+log() { echo "\$(\$L \$B/date -u +%FT%TZ) \$*" >> $rt/logfs/log; echo "takeover: \$*" > /dev/kmsg; }
+hashdisk() { \$L \$B/dd if=$disk iflag=direct,count_bytes count=$rbytes bs=4M status=none | \$L \$B/sha256sum; }
+emit() { while read -r lo off len; do
+  \$L \$B/dd if=$disk iflag=direct,skip_bytes,count_bytes skip=\$off count=\$len bs=4M status=none
+done < $rt/extents | \$L \$B/head -c $fsize; }
+try=0
+while [ \$try -lt 2 ]; do
+  try=\$((try+1)); log "write attempt \$try"
+  emit | \$L \$B/zstd -dc | \$L \$B/dd of=$disk bs=4M iflag=fullblock oflag=direct conv=fsync status=none
+  \$L \$B/sync
+  log "write done, verifying"
+  got=\$(hashdisk)
+  log "written sha256 \${got%% *}"
+  if [ "\${got%% *}" = "$rsha" ]; then log "VERIFY OK, rebooting"; \$L \$B/sync; echo b > /proc/sysrq-trigger; fi
+  again=\$(hashdisk)
+  if [ "\${again%% *}" != "\${got%% *}" ]; then log "VERIFY MISMATCH and disk still changing (\${again%% *}); something is writing"; else log "VERIFY MISMATCH (stable)"; fi
+done
+log "GAVE UP after \$try attempts; NOT rebooting"
+EOF
+
+echo "== quiescing: swapoff, stopping services"
+swapoff -a || true
+for s in $services; do systemctl stop "$s" 2>/dev/null || true; done
+sync
+echo 1 > /proc/sys/kernel/sysrq
+mkdir -p "$rt/logfs"
+echo "== remounting all filesystems read-only (sysrq u) and starting writer; log: $rt/logfs/log"
+echo u > /proc/sysrq-trigger
+sleep 2
+# A read-only mount is not enough: ext4's error path still rewrites its
+# superblock. Block writes at the block layer for every mounted partition of
+# the target disk (not the whole disk, which the writer needs).
+dname=$(basename "$(readlink -f "$disk")")
+for p in /sys/class/block/"$dname"/"$dname"*; do
+  [ -e "$p" ] || continue
+  pn=$(basename "$p")
+  if grep -q "^/dev/$pn " /proc/mounts || grep -q "^/dev/$pn " /proc/swaps; then
+    blockdev --setro "/dev/$pn"
+    [ "$(blockdev --getro "/dev/$pn")" = 1 ] || die "could not set /dev/$pn read-only"
+    echo "   /dev/$pn set read-only"
+  fi
+done
+[ "$(blockdev --getro "$disk")" = 0 ] || die "$disk itself is read-only"
+# sysrq u may also flip tmpfs to read-only; give the writer a fresh tmpfs for its log.
+mount -t tmpfs -o size=8m r2rlog "$rt/logfs" || true
+setsid "$ld" --library-path "$rt/lib" "$rt/bin/bash" "$rt/run.sh" </dev/null >/dev/null 2>&1 &
+echo "writer started (pid $!). Expect the SSH session to drop when the host reboots."
+echo "If it does not come back: open the provider console and read the 'takeover:' kernel messages."

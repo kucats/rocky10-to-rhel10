@@ -1,0 +1,120 @@
+#!/usr/bin/env bash
+# Boot the prepared raw image locally in qemu, on a copy-on-write overlay,
+# with the target's MAC and a slirp network shaped like the target subnet,
+# then check cloud-init, the static address, SSH and a few image settings.
+# The raw image is never modified.
+#
+# Usage: r2r-local-test [-c config.env] [--break-efi] [--keep]
+#   --break-efi  zero the first 4 KiB of the EFI partition in the overlay, to
+#                prove that the nofail /boot/efi entry lets the system boot
+#   --keep       leave the VM running after the checks (serial log in WORKDIR)
+set -euo pipefail
+R2R_ROOT=$(cd "$(dirname "$0")/.." && pwd)
+. "$R2R_ROOT/lib/common.sh"
+
+cfg=""; break_efi=no; keep=no
+while [ $# -gt 0 ]; do
+  case $1 in
+    -c) cfg=$2; shift 2 ;;
+    --break-efi) break_efi=yes; shift ;;
+    --keep) keep=yes; shift ;;
+    -h|--help) sed -n '2,10p' "$0"; exit 0 ;;
+    *) die "unknown argument $1" ;;
+  esac
+done
+r2r_load_config "$cfg"
+need_cmd qemu-system-x86_64 qemu-img ssh ssh-keyscan
+work=$(cfg_path "$WORKDIR")
+man=$work/$IMAGE_NAME.manifest
+[ -f "$man" ] || die "no manifest $man; run r2r-prepare-image first"
+# shellcheck disable=SC1090
+. "$man"
+raw=$work/$RAW_FILE
+port=${TEST_SSH_PORT:-2222}
+key=${TEST_SSH_KEY:?set TEST_SSH_KEY}
+user=${TEST_SSH_USER:-$ADMIN_USER}
+
+if [ "$NET_MODE" = static ]; then
+  ip=${IPV4_ADDR%/*}
+  net="net=$(cidr4_network "$IPV4_ADDR"),host=$IPV4_GW"
+else
+  ip=192.0.2.15 net="net=192.0.2.0/24,host=192.0.2.2,dhcpstart=192.0.2.15"
+fi
+
+overlay=$work/$IMAGE_NAME.test.qcow2
+serial=$work/$IMAGE_NAME.test.serial.log
+rm -f "$overlay" "$serial"
+qemu-img create -q -f qcow2 -F raw -b "$raw" "$overlay" "${TEST_DISK_SIZE:-50G}"
+if [ "$break_efi" = yes ]; then
+  [ -n "${EFI_OFFSET:-}" ] || die "manifest has no EFI_OFFSET"
+  need_cmd qemu-io
+  qemu-io -f qcow2 -c "write -z $EFI_OFFSET 4k" "$overlay" >/dev/null
+  log "zeroed 4 KiB at EFI offset $EFI_OFFSET (overlay only)"
+fi
+
+accel=tcg; [ -w /dev/kvm ] && accel=kvm
+log "booting (accel $accel); guest $ip:22 -> 127.0.0.1:$port; serial log $serial"
+qemu-system-x86_64 -M pc -accel "$accel" -cpu max -m 1024 -smp 2 \
+  -drive file="$overlay",if=virtio,format=qcow2 \
+  -netdev "user,id=n0${net:+,$net},hostfwd=tcp:127.0.0.1:$port-$ip:22" \
+  -device virtio-net-pci,netdev=n0,mac="$NIC_MAC" \
+  -display none -serial file:"$serial" -daemonize -pidfile "$work/qemu.pid"
+qpid=$(cat "$work/qemu.pid")
+stop_vm() { [ "$keep" = yes ] || kill "$qpid" 2>/dev/null || true; }
+trap stop_vm EXIT
+
+deadline=$(( $(date +%s) + ${TEST_TIMEOUT:-900} ))
+until ssh-keyscan -p "$port" -T 5 127.0.0.1 >"$work/test.hostkeys" 2>/dev/null && [ -s "$work/test.hostkeys" ]; do
+  [ "$(date +%s)" -lt "$deadline" ] || die "no SSH within ${TEST_TIMEOUT:-900}s; see $serial"
+  sleep 10
+done
+log "sshd answered; host keys:"
+ssh-keygen -lf "$work/test.hostkeys" >&2
+if [ -n "${HOSTKEY_DIR:-}" ]; then
+  for f in "$(cfg_path "$HOSTKEY_DIR")"/ssh_host_*_key.pub; do
+    fp=$(ssh-keygen -lf "$f" | awk '{print $2}')
+    if ssh-keygen -lf "$work/test.hostkeys" | grep -q "$fp"; then log "preserved host key OK: $(basename "$f")"
+    else warn "host key $(basename "$f") NOT presented"; fi
+  done
+fi
+
+S="ssh -p $port -i $key -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR $user@127.0.0.1"
+fail=0
+check() { # description, remote command
+  if $S "$2" >/dev/null 2>&1; then log "PASS $1"; else warn "FAIL $1"; fail=1; fi
+}
+until $S true 2>/dev/null; do
+  [ "$(date +%s)" -lt "$deadline" ] || die "cannot log in as $user"
+  sleep 10
+done
+$S 'cloud-init status --wait --long' >&2 || true
+check "cloud-init finished without errors" 'cloud-init status | grep -q "status: done"'
+check "x86-64-v3 reported" "/usr/lib64/ld-linux-x86-64.so.2 --help | grep -q 'x86-64-v3 (supported'"
+[ "$NET_MODE" = static ] && check "static IPv4 $IPV4_ADDR on $NIC_NAME" "ip -4 -o addr show dev $NIC_NAME | grep -qF ' $IPV4_ADDR '"
+[ -n "${IPV6_ADDR:-}" ] && check "IPv6 $IPV6_ADDR" "ip -6 -o addr show dev $NIC_NAME | grep -qF ' $IPV6_ADDR '"
+check "hostname $HOSTNAME_FQDN" "[ \"\$(hostname -f 2>/dev/null || hostname)\" = $HOSTNAME_FQDN ]"
+check "root filesystem grown beyond the raw size" "[ \$(findmnt -bno SIZE /) -gt $RAW_BYTES ]"
+methods=$(ssh -v -p "$port" -o BatchMode=yes -o PubkeyAuthentication=no -o StrictHostKeyChecking=no \
+  -o UserKnownHostsFile=/dev/null "$user@127.0.0.1" true 2>&1 | awk -F': ' '/Authentications that can continue/ {print $2; exit}')
+case $methods in
+  *password*|*keyboard-interactive*) warn "FAIL server offers: $methods"; fail=1 ;;
+  "") warn "FAIL could not read the server's auth methods"; fail=1 ;;
+  *) log "PASS password authentication off (server offers: $methods)" ;;
+esac
+if [ "$user" = "${AUTOMATION_USER:-}" ]; then
+  check "passwordless sudo for $user" 'sudo -n true'
+else
+  check "sudo for $user requires a password" '! sudo -n true'
+fi
+check "cockpit.socket not active" "! systemctl is-active -q cockpit.socket"
+check "kdump not enabled" "! systemctl is-enabled -q kdump.service"
+[ "$break_efi" = yes ] || check "no failed units" "[ -z \"\$(systemctl --failed --no-legend)\" ]"
+check "SELinux enforcing" "[ \"\$(getenforce)\" = Enforcing ]"
+if [ "$break_efi" = yes ]; then
+  log "INFO /boot/efi with zeroed EFI: $($S 'findmnt -n /boot/efi || echo not mounted')"
+else
+  check "/boot/efi mounted" "findmnt -n /boot/efi"
+fi
+$S 'id; uname -r; cat /etc/redhat-release' >&2 || true
+[ "$fail" = 0 ] || die "some checks failed (VM serial log: $serial)"
+log "ALL CHECKS PASSED"

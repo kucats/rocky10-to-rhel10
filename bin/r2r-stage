@@ -1,0 +1,96 @@
+#!/usr/bin/env bash
+# Stage the image on the target (the running Rocky Linux 10 VPS) and run the
+# writer in check mode. Never writes the disk: it prints the write command
+# for you to run yourself.
+#
+# Usage: r2r-stage [-c config.env] [--skip-preflight]
+#
+# Steps (over ssh to $TARGET_SSH, with $TARGET_SUDO):
+#   1. copy bin/r2r-takeover and the libs to $STAGE_DIR
+#   2. install dependencies (zstd ...) and run the source-OS and provider preflight
+#   3. fallocate a filler file, so the staged image lands beyond the region
+#      that will be overwritten (a heuristic: step 5 is the real gate)
+#   4. stream the .zst onto the target's own disk and verify its checksum
+#   5. r2r-takeover check
+set -euo pipefail
+R2R_ROOT=$(cd "$(dirname "$0")/.." && pwd)
+. "$R2R_ROOT/lib/common.sh"
+
+cfg=""; preflight=yes
+while [ $# -gt 0 ]; do
+  case $1 in
+    -c) cfg=$2; shift 2 ;;
+    --skip-preflight) preflight=no; shift ;;
+    -h|--help) sed -n '2,15p' "$0"; exit 0 ;;
+    *) die "unknown argument $1" ;;
+  esac
+done
+r2r_load_config "$cfg"
+require_vars TARGET_SSH STAGE_DIR TARGET_DISK
+need_cmd ssh tar
+work=$(cfg_path "$WORKDIR")
+man=$work/$IMAGE_NAME.manifest
+[ -f "$man" ] || die "no manifest $man; run r2r-prepare-image first"
+# shellcheck disable=SC1090
+. "$man"
+zst=$work/$ZST_FILE
+[ -f "$zst" ] || die "missing $zst"
+[ "$(sha256_of "$zst")" = "$ZST_SHA256" ] || die "local $zst does not match the manifest"
+
+raw_gib=$(( (RAW_BYTES + R2R_GIB - 1) / R2R_GIB ))
+filler_gb=${FILLER_GB:-$(( raw_gib + 2 > 12 ? raw_gib + 2 : 12 ))}
+D=$STAGE_DIR
+safe='^/[A-Za-z0-9._/-]+$'
+printf '%s' "$D" | grep -Eq "$safe" || die "STAGE_DIR must be an absolute path of [A-Za-z0-9._/-]"
+printf '%s' "$TARGET_DISK" | grep -Eq "$safe" || die "bad TARGET_DISK"
+sudo=${TARGET_SUDO-sudo}
+# shellcheck disable=SC2086
+r() { ssh ${TARGET_SSH_OPTS:-} "$TARGET_SSH" "$@"; }
+
+log "1/5 copying tools to $TARGET_SSH:$D"
+COPYFILE_DISABLE=1 tar -C "$R2R_ROOT" -cf - bin/r2r-takeover lib/common.sh \
+    "lib/os/$SOURCE_OS.sh" "lib/provider/$PROVIDER.sh" \
+  | r "$sudo sh -c 'mkdir -p $D && chmod 700 $D && tar -C $D --no-same-owner -xf - && chmod 700 $D/bin/r2r-takeover'"
+
+# Remote bash scripts go over stdin, so there is no nested quoting.
+remote() {
+  r "$sudo env R2R_ROOT=$D SOURCE_OS=$SOURCE_OS PROVIDER=$PROVIDER TARGET_DISK=$TARGET_DISK FIRMWARE=$FIRMWARE NET_MODE=$NET_MODE bash -s"
+}
+lib=". $D/lib/common.sh; . $D/lib/os/$SOURCE_OS.sh; . $D/lib/provider/$PROVIDER.sh"
+
+log "2/5 installing dependencies and running preflight"
+remote <<EOF
+set -e; $lib
+${SOURCE_OS}_install_deps >/dev/null </dev/null
+EOF
+if [ "$preflight" = yes ]; then
+  remote <<EOF || die "preflight failed on the target (see warnings above); fix it or use --skip-preflight"
+$lib
+rc=0
+${SOURCE_OS}_preflight $D $RAW_BYTES $ZST_BYTES $((filler_gb * R2R_GIB)) || rc=1
+provider_preflight || rc=1
+exit \$rc
+EOF
+fi
+
+log "3/5 creating ${filler_gb}G filler"
+r "$sudo sh -c 'rm -f $D/image.raw.zst $D/filler && sync && fallocate -l ${filler_gb}G $D/filler && sync'"
+
+log "4/5 uploading $(basename "$zst") ($ZST_BYTES bytes)"
+r "$sudo sh -c 'umask 077; cat > $D/image.raw.zst && sync'" < "$zst"
+remote_sha=$(r "$sudo sha256sum $D/image.raw.zst" | awk '{print $1}')
+[ "$remote_sha" = "$ZST_SHA256" ] || die "uploaded file checksum mismatch ($remote_sha)"
+
+log "5/5 r2r-takeover check"
+cmd="$D/bin/r2r-takeover write $D/image.raw.zst $ZST_SHA256 $RAW_SHA256 $RAW_BYTES $TARGET_DISK"
+r "$sudo $D/bin/r2r-takeover check $D/image.raw.zst $ZST_SHA256 $RAW_SHA256 $RAW_BYTES $TARGET_DISK" \
+  || die "check failed. If it reported an overlap with the overwrite region, raise FILLER_GB (now $filler_gb) and run r2r-stage again."
+
+cat >&2 <<EOF
+
+Staged and checked. Nothing has been written to the disk.
+Before writing: take your backups, open the provider console, stop other
+sessions on the host. Then, on the target as root (ssh -t for the prompt):
+
+  $cmd
+EOF
